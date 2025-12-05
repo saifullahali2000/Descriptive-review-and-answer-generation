@@ -10,15 +10,18 @@ import streamlit as st
 
 st.set_page_config(page_title="Cheat Sheet Checker + Answers", layout="wide")
 st.title("📋 Questions vs Cheat Sheet (Alignment + Grammar + Answers)")
-st.caption("Outputs persist (won’t vanish on dropdown changes). Answers are plain text (no markdown fences).")
+st.caption(
+    "Paste cheat sheet (Markdown + code). Upload questions (CSV/TSV/XLSX). "
+    "Answers are plain text. Results persist (won’t disappear on dropdown changes)."
+)
 
 # ---------------- SESSION STATE ----------------
 if "res_df" not in st.session_state:
     st.session_state.res_df = None
 if "answers_df" not in st.session_state:
     st.session_state.answers_df = None
-if "ran_once" not in st.session_state:
-    st.session_state.ran_once = False
+if "last_run_error" not in st.session_state:
+    st.session_state.last_run_error = None
 
 
 # ---------------- NORMALIZE ----------------
@@ -148,11 +151,11 @@ def parse_mark(m) -> int:
         return 1
 
 
-# ---------------- ANSWER CLEANUP: remove accidental markdown fences ----------------
+# ---------------- ANSWER CLEANUP (NO MARKDOWN) ----------------
 def strip_markdown_fences(text: str) -> str:
     if not text:
         return ""
-    # Convert ```...\n...\n``` blocks to indented code
+
     def repl(match):
         code = (match.group(2) or "").strip("\n")
         lines = code.splitlines()
@@ -165,7 +168,16 @@ def strip_markdown_fences(text: str) -> str:
 
 # ---------------- LLM CALLS ----------------
 def call_openai(api_key: str, model: str, messages: List[Dict[str, str]], temperature: float) -> str:
-    from openai import OpenAI
+    # Lazy import so the app can show a friendly error if openai isn't installed
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        raise RuntimeError(
+            "OpenAI Python package not found. Install it with:\n"
+            "  py -m pip install --upgrade openai\n\n"
+            f"Original import error: {e}"
+        )
+
     client = OpenAI(api_key=api_key)
     resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
     return resp.choices[0].message.content or ""
@@ -182,9 +194,16 @@ def call_perplexity(api_key: str, model: str, messages: List[Dict[str, str]], te
     return (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
 
 
-def llm_json(provider: str, api_key: str, model: str, messages: List[Dict[str, str]], temperature: float) -> Dict[str, Any]:
+def llm_json(
+    provider: str,
+    api_key: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+) -> Dict[str, Any]:
     for attempt in range(2):
         text = call_openai(api_key, model, messages, temperature) if provider == "OpenAI" else call_perplexity(api_key, model, messages, temperature)
+
         try:
             return json.loads(text)
         except Exception:
@@ -194,12 +213,22 @@ def llm_json(provider: str, api_key: str, model: str, messages: List[Dict[str, s
                     return json.loads(m.group(0))
                 except Exception:
                     pass
+
         if attempt == 0:
             messages = messages + [{"role": "user", "content": "Return ONLY valid JSON. No extra text."}]
-    raise ValueError("Could not parse JSON.")
+
+    raise ValueError("Could not parse JSON from model output.")
 
 
-def analyze_batch(provider, api_key, model, cheat_sheet_md, questions, strictness, temperature):
+def analyze_batch(
+    provider: str,
+    api_key: str,
+    model: str,
+    cheat_sheet_md: str,
+    questions: List[Dict[str, Any]],
+    strictness: str,
+    temperature: float,
+) -> List[Dict[str, Any]]:
     cs = cheat_sheet_md.strip()
     if len(cs) > 24000:
         cs = cs[:24000] + "\n\n[CHEAT SHEET TRUNCATED]"
@@ -207,22 +236,36 @@ def analyze_batch(provider, api_key, model, cheat_sheet_md, questions, strictnes
     system = f"""
 You are a strict syllabus-alignment and question-quality reviewer AND answer writer.
 
+Cheat sheet is MARKDOWN (may include code blocks).
+Question text may include code too.
+
 OUTPUT REQUIREMENT:
-- Answer must be PLAIN TEXT ONLY.
-- Do NOT use triple backticks or markdown.
-- If including code, show as indented lines (4 spaces).
-- Use clean formatting: Definition:, Explanation:, Example:, and '-' bullet points.
+- Answer must be PLAIN TEXT ONLY (NOT Markdown).
+- Do NOT use triple backticks.
+- If you include code, show it as indented lines (4 spaces).
+- Use clean formatting like:
+  Definition:
+  Explanation:
+  Points:
+  Example:
+and bullet points with '-'.
 
-Rules:
-- If not aligned with cheat sheet: is_aligned='no' and answer=''.
-- Do not hallucinate outside cheat sheet.
-- Do not change code logic.
+RULES:
+1) Alignment:
+- If not covered by cheat sheet: is_aligned="no" and answer must be "".
+- Do NOT hallucinate content outside cheat sheet.
 
-Answer depth by marks:
-1: 2–4 lines
-2: short paragraph + 2 bullets
-4: structured + example
-8: detailed step-by-step + example + key points
+2) Grammar/formation:
+- Identify grammar/clarity issues and list them.
+- If needed, provide improved_question.
+- Do NOT change code logic.
+
+3) Answer generation (only if aligned):
+Depth by marks:
+- 1 mark: 2–4 lines
+- 2 marks: short paragraph + 2 bullet points
+- 4 marks: structured explanation + example (include code if useful)
+- 8 marks: detailed step-by-step + example + key points
 
 Return ONLY JSON:
 {{
@@ -235,22 +278,27 @@ Return ONLY JSON:
       "grammar_score": 1-10,
       "has_issues": "yes|no",
       "issues": ["..."],
-      "improved_question": "",
-      "cheatsheet_evidence": ["..."],
-      "answer": ""
+      "improved_question": "string (empty if no issues)",
+      "cheatsheet_evidence": ["keywords/phrases from cheat sheet"],
+      "answer": "plain text string (empty if not aligned)"
     }}
   ]
 }}
 Strictness={strictness}
 """.strip()
 
-    user = {"role": "user", "content": json.dumps({"cheat_sheet_markdown": cs, "questions": questions}, ensure_ascii=False)}
-    out = llm_json(provider, api_key, model, [{"role": "system", "content": system}, user], temperature)
+    user = {
+        "role": "user",
+        "content": json.dumps({"cheat_sheet_markdown": cs, "questions": questions}, ensure_ascii=False),
+    }
 
+    out = llm_json(provider, api_key, model, [{"role": "system", "content": system}, user], temperature)
     results = out.get("results", [])
+
     for r in results:
         r["answer"] = strip_markdown_fences(str(r.get("answer", "")).strip())
         r["improved_question"] = strip_markdown_fences(str(r.get("improved_question", "")).strip())
+
     return results
 
 
@@ -261,12 +309,25 @@ with st.sidebar:
     api_key = st.text_input("Paste API Key", type="password")
 
     st.subheader("Model")
-    model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"] if provider == "OpenAI" else ["sonar-pro", "sonar"], index=0)
+    model = st.selectbox(
+        "Model",
+        ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"] if provider == "OpenAI" else ["sonar-pro", "sonar"],
+        index=0,
+    )
 
     temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05)
     strictness = st.selectbox("Alignment strictness", ["strict", "medium", "lenient"], index=0)
+
+    st.subheader("Batching")
     batch_size = st.slider("Questions per call", 3, 20, 6, 1)
     sleep_s = st.slider("Delay between calls (sec)", 0.0, 2.0, 0.1, 0.1)
+
+    st.subheader("Utilities")
+    if st.button("🧹 Clear stored results"):
+        st.session_state.res_df = None
+        st.session_state.answers_df = None
+        st.session_state.last_run_error = None
+        st.success("Cleared. Upload and run again.")
 
 
 # ---------------- INPUTS ----------------
@@ -279,15 +340,23 @@ uploaded = st.file_uploader("Upload .xlsx/.xls or .csv/.tsv", type=["xlsx", "xls
 sheet = None
 if uploaded and uploaded.name.lower().endswith((".xlsx", ".xls")):
     try:
-        sheet = st.selectbox("Select Excel sheet", list_excel_sheets(uploaded), index=0)
+        sheets = list_excel_sheets(uploaded)
+        sheet = st.selectbox("Select Excel sheet", sheets, index=0)
     except Exception as e:
-        st.error(f"Could not read Excel sheet names: {e}")
+        st.error(f"Could not read Excel sheet names. Error: {e}")
 
-# Button triggers analysis and stores outputs
-if st.button("🚀 Analyze + Generate Answers", disabled=(not uploaded or not cheat_sheet_md.strip() or not api_key)):
+
+# ---------------- RUN BUTTON ----------------
+run = st.button("🚀 Analyze + Generate Answers", disabled=(not uploaded or not cheat_sheet_md.strip() or not api_key))
+
+if run:
     try:
         df_raw = read_table_file(uploaded, sheet_name=sheet)
         df = map_columns(df_raw)
+
+        st.write("Detected columns:", list(df.columns))
+        st.dataframe(df.head(10), use_container_width=True)
+
         err = validate_df(df)
         if err:
             st.error(err)
@@ -313,22 +382,30 @@ if st.button("🚀 Analyze + Generate Answers", disabled=(not uploaded or not ch
             progress.progress(min((i + len(batch)) / total, 1.0))
             time.sleep(sleep_s)
 
+        status.write("✅ Done")
+
         res_df = pd.DataFrame(all_results).fillna("")
         answers_df = res_df[["question_text", "mark", "is_aligned", "answer"]].copy()
 
         st.session_state.res_df = res_df
         st.session_state.answers_df = answers_df
-        st.session_state.ran_once = True
+        st.session_state.last_run_error = None
 
     except Exception as e:
+        st.session_state.last_run_error = str(e)
         st.error(f"Error: {e}")
-        st.stop()
 
-# ---------------- RENDER STORED RESULTS (PERSISTS ON DROPDOWN CHANGE) ----------------
+
+# ---------------- RENDER PERSISTED OUTPUTS ----------------
+if st.session_state.last_run_error:
+    st.warning("Last run error (stored):")
+    st.code(st.session_state.last_run_error)
+
 if st.session_state.res_df is not None and st.session_state.answers_df is not None:
     res_df = st.session_state.res_df
     answers_df = st.session_state.answers_df
 
+    st.divider()
     st.subheader("✅ Answers (Separate Table)")
     st.dataframe(answers_df, use_container_width=True)
 
@@ -346,21 +423,33 @@ if st.session_state.res_df is not None and st.session_state.answers_df is not No
     if issues_df.empty:
         st.success("No grammar/formation issues found.")
     else:
-        st.dataframe(issues_df[["question_text", "mark", "grammar_score", "issues", "improved_question"]], use_container_width=True)
+        st.dataframe(
+            issues_df[["question_text", "mark", "grammar_score", "issues", "improved_question"]],
+            use_container_width=True,
+        )
 
     st.subheader("❌ Not Aligned with Cheat Sheet")
     not_aligned_df = res_df[res_df["is_aligned"].astype(str).str.lower().eq("no")].copy()
     if not not_aligned_df.empty:
-        st.dataframe(not_aligned_df[["question_text", "mark", "alignment_reason", "cheatsheet_evidence"]], use_container_width=True)
+        st.dataframe(
+            not_aligned_df[["question_text", "mark", "alignment_reason", "cheatsheet_evidence"]],
+            use_container_width=True,
+        )
     else:
         st.success("All questions appear aligned (based on selected strictness).")
 
     st.subheader("⬇️ Download")
-    st.download_button("Download Full Results CSV", data=res_df.to_csv(index=False).encode("utf-8"),
-                       file_name="analysis_results_with_plaintext_answers.csv", mime="text/csv")
-    st.download_button("Download Answers CSV", data=answers_df.to_csv(index=False).encode("utf-8"),
-                       file_name="answers_plain_text.csv", mime="text/csv")
-
+    st.download_button(
+        "Download Full Results CSV",
+        data=res_df.to_csv(index=False).encode("utf-8"),
+        file_name="analysis_results_with_plaintext_answers.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download Answers CSV",
+        data=answers_df.to_csv(index=False).encode("utf-8"),
+        file_name="answers_plain_text.csv",
+        mime="text/csv",
+    )
 else:
-    if st.session_state.ran_once:
-        st.warning("No stored results found. Click 'Analyze + Generate Answers' again.")
+    st.info("Upload your file, paste cheat sheet, enter API key, then click 'Analyze + Generate Answers'.")
